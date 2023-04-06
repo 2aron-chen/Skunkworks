@@ -132,3 +132,4 @@ if __name__ == "__main__":
     print(loss_list)
     model = torch.nn.Linear(20,1)
     model.load_state_dict(torch.load("checkpoint.pt"))
+    
