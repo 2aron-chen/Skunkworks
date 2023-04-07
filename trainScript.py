@@ -336,7 +336,7 @@ if __name__=="__main__":
     parser.add_argument('fold', type=int, help='which fold of 1-5')
     # args = parser.parse_args()
     
-    kfsplitter = kf(n_splits=5, shuffle=True, random_state=69420)
+    kfsplitter = kf(n_splits=1, shuffle=True, random_state=69420)
 
     for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
         
