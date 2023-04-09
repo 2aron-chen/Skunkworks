@@ -3,28 +3,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
-from torchmetrics import StructuralSimilarityIndexMeasure
-from statistics import median, mean
 from matplotlib import pyplot as plt
 import numpy as np
-from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
-from torchsummary import summary
 import json
 from tqdm import tqdm
 from glob import glob
 import os
 import sys
-path = "/study3/mrphys/skunkworks/kk/mriUnet"
+path = "/study/mrphys/skunkworks/kk/mriUnet"
 sys.path.insert(0,path)
 import unet
-from torchvision import transforms
 from torch.utils.data import Dataset
 from sklearn.model_selection import KFold as kf
 import nibabel as nib
+from torch.distributed import init_process_group, destroy_process_group
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-T1path = sorted(glob('/study3/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
-xPath = sorted(glob('/scratch/mrphys/skunkworks/denoised/denoised_*.h5'))
-gtPath = sorted(glob('/study3/mrphys/skunkworks/training_data/mover01/*/processed_data/C.h5'))
+T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
+xPath = sorted(glob('/scratch/mrphys/denoised/denoised_*.h5'))
+gtPath = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/C.h5'))
 
 def slice2d(array, discardZero=False):
     '''
@@ -82,17 +81,17 @@ class T1Dataset(Dataset):
     def __len__(self):
         return len(self.x)
 
-traintestData  = []
+# DDP SETUP
 
-pbar = tqdm(range(len(T1path)), desc="loading datasets")
-
-for i in pbar:
-    with open(f'/scratch/mrphys/pickled/T1dataset2_{i}.pickle', 'rb') as f:
-        data = pickle.load(f)
-        traintestData.append(data)
-        del data
-
-transformIdentity = lambda x : x
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 class Trainer:
     
@@ -105,6 +104,7 @@ class Trainer:
                  discriminator = None,
                  device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu"),
                  unsupervised = False,
+                 gpu_id = 0,
                 ):
         
         self.lossCounter = {
@@ -159,9 +159,10 @@ class Trainer:
         for batch, (X, y) in pbar:
             
             X, y = X.to(self.device), y.to(self.device).float()
-            pred = torch.abs(self.model(X))
+            
             
             if self.gan: # train discrim first
+                pred = torch.abs(self.model(X))
                 self.optim_d.zero_grad()
                 fake_pred = torch.sigmoid(self.dis(pred.detach(), torch.abs(X)))
                 real_pred = torch.sigmoid(self.dis(y, torch.abs(X)))
@@ -368,22 +369,36 @@ class Trainer:
                 print('Loss stops improving -> EARLY STOPPING')
                 break
 
-if __name__=="__main__":
-    
-    kfsplitter = kf(n_splits=5, shuffle=True, random_state=69420)
-    
-    fold = 1
+def prepare_dataloader(dataset, batch_size):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        pin_memory=True,
+        shuffle=False,
+        sampler=DistributedSampler(dataset)
+    )
 
-    for train_index, test_index in kfsplitter.split(traintestData):
-        trainData = [traintestData[i] for i in train_index]
-        testData = [traintestData[i] for i in test_index]
-        BATCHSIZE = 32
+def run(rank, world_size, folds=5, batch_size=32):
+    ddp_setup(rank, world_size)
+    traintestData = []
+    pbar = tqdm(range(len(T1path)), desc="loading datasets")
+
+    for i in pbar:
+        with open(f'/scratch/mrphys/pickled/T1dataset2_{i}.pickle', 'rb') as f:
+            data = pickle.load(f)
+            traintestData.append(data)
+            del data
+
+    kfsplitter = kf(n_splits=5, shuffle=True, random_state=69420)
+    for i , (train_index, test_index)in enumerate(kfsplitter.split(traintestData)):
+        fold = i + 1
+        trainData = [traintestData[y] for y in train_index]
+        testData = [traintestData[y] for y in test_index]
         trainDataset = torch.utils.data.ConcatDataset(trainData)
         testDataset = torch.utils.data.ConcatDataset(testData)
-        print(len(trainDataset), len(testDataset))
 
-        trainDataloader = DataLoader(dataset=trainDataset, batch_size=BATCHSIZE, shuffle=True)
-        testDataloader = DataLoader(dataset=testDataset, batch_size=BATCHSIZE, shuffle=False)
+        trainDataloader = prepare_dataloader(trainDataset, batch_size)
+        testDataloader = prepare_dataloader(testDataset, batch_size)
         
         model = unet.UNet(6,
             1,
@@ -420,8 +435,14 @@ if __name__=="__main__":
             model_name = name, 
             discriminator = discriminator,
             unsupervised = True,
+            gpu_id = rank
         )
         trainer.trainLoop(100, fromCheckpoint = False)
         
         fold += 1
         break #train for 1 fold!
+
+
+if __name__=="__main__":
+    world_size = torch.cuda.device_count()//2
+    mp.spawn(run, args=(world_size,), nprocs=world_size)
