@@ -13,7 +13,7 @@ import json
 from tqdm import tqdm
 from glob import glob
 import sys
-path = "/study3/mrphys/skunkworks/kk/mriUnet"
+path = "/study/mrphys/skunkworks/kk/mriUnet"
 sys.path.insert(0,path)
 import unet
 from torchvision import transforms
@@ -23,9 +23,9 @@ from sklearn.model_selection import KFold as kf
 import os
 import nibabel as nib
 
-T1path = sorted(glob('/study3/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
+T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
 xPath = sorted(glob('/scratch/mrphys/denoised/denoised_*.h5'))
-gtPath = sorted(glob('/study3/mrphys/skunkworks/training_data/mover01/*/processed_data/C.h5'))
+gtPath = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/C.h5'))
 
 def slice2d(array, discardZero=False):
     '''
@@ -47,7 +47,7 @@ def getComplexSlices(path, return_scale=False):
         prefix = 'C_000_0'
         imagestackReal = []
         imagestackImag = []
-        for i in range(6):
+        for i in range(10):
             n = prefix + str(i).zfill(2)
             image = hf['Images'][n]
             imagestackReal.append(np.array(image['real']))
@@ -85,5 +85,5 @@ class T1Dataset(Dataset):
     
 for i in tqdm(range(len(T1path))):
     dataset = T1Dataset(i, gt=False)
-    with open(f'/scratch/mrphys/pickled/T1dataset2_{i}.pickle', 'wb') as f:
+    with open(f'/scratch/mrphys/T1pickled/T1dataset_{i}.pickle', 'wb') as f:
         pickle.dump(dataset, f)
