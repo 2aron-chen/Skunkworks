@@ -15,6 +15,18 @@ def conv(in_channels, out_channels, kernel_size, bias=False, padding=1, groups=1
         return nn.Conv3d(in_channels, out_channels, kernel_size, padding=padding, bias=bias, groups=groups)
     else:
         raise ValueError(f'Convolution  must be 2D or 3D passed {ndims}')
+        
+class ComplexNorm(nn.Module):
+    '''
+    Performs batch norm independently on real and imaginary part.
+    '''
+    def __init__(self, num_features, normType, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super(ComplexNorm, self).__init__()
+        self.bn_r = normType(num_features, eps, momentum, affine, track_running_stats)
+        self.bn_i = normType(num_features, eps, momentum, affine, track_running_stats)
+
+    def forward(self,input):
+        return self.bn_r(input.real) +1J*self.bn_i(input.imag)
 
 
 class VarNorm2d(nn.BatchNorm2d):
@@ -125,19 +137,22 @@ class ConvBlock(nn.Sequential):
                 in_channels = out_channels
             elif char == 'instance norm':
                 if ndims == 2:
-                    self.add_module(f'instancenorm{i}', nn.InstanceNorm2d(out_channels))
-                else:
-                    self.add_module(f'instancenorm{i}', nn.InstanceNorm3d(out_channels))
+                    layer = ComplexNorm(out_channels, normType=nn.InstanceNorm2d)
+                else: 
+                    layer = ComplexNorm(out_channels, normType=nn.InstanceNorm3d)
+                self.add_module(f'instancenorm{i}', layer)
             elif char == 'batch norm':
                 if ndims == 2:
-                    self.add_module(f'instancenorm{i}', nn.BatchNorm2d(out_channels))
-                else:
-                    self.add_module(f'instancenorm{i}', nn.BatchNorm3d(out_channels))
+                    layer = ComplexNorm(out_channels, normType=nn.BatchNorm2d)
+                else: 
+                    layer = ComplexNorm(out_channels, normType=nn.BatchNorm3d)
+                self.add_module(f'batchnorm{i}', layer)
             elif char == 'variation norm':
                 if ndims == 2:
-                    self.add_module(f'instancenorm{i}', VarNorm2d(out_channels))
-                else:
-                    self.add_module(f'instancenorm{i}', VarNorm3d(out_channels))
+                    layer = ComplexNorm(out_channels, normType=VarNorm2d)
+                else: 
+                    layer = ComplexNorm(out_channels, normType=VarNorm3d)
+                self.add_module(f'varnorm{i}', layer)
             else:
                 raise ValueError(f"Unsupported layer type '{char}'")
 
@@ -187,7 +202,7 @@ class DoubleConv(nn.Module):
     def forward(self, x, t):
         time_encoding = self.time_mlp(t)
         x = self.ConvBlock1(x)
-        x = x+t
+        x = x+time_encoding.unsqueeze(-1).unsqueeze(-1)
         x = self.ConvBlock2(x)
         return x
 

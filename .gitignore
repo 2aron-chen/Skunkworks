@@ -1,3 +1,6 @@
 pred/
 outputs/
 Skunkworks/
+ddpm/
+key
+key.pub
