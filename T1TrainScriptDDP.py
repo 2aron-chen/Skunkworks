@@ -237,7 +237,7 @@ def run(rank, world_size, name, gt=False, batch_size=32, folds=5):
         model = unet.UNet(
             10,
             1,
-            f_maps=32,
+            f_maps=16,
             layer_order=['separable convolution', 'relu','batch norm'],
             depth=4,
             layer_growth=2.0,
