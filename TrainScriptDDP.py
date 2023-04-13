@@ -21,52 +21,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-# dataset 
-allImages = sorted(glob("/study/mrphys/skunkworks/training_data//mover01/*/", recursive=True))
-def getComplexSlices(path):
-
-    with h5py.File(path,'r') as hf:
-        prefix = 'C_000_0'
-        imagestackReal = []
-        imagestackImag = []
-        for i in range(10):
-            n = prefix + str(i).zfill(2)
-            image = hf['Images'][n]
-            imagestackReal.append(np.array(image['real']))
-            imagestackImag.append(np.array(image['imag']))
-            if i==0:
-                normScale = np.abs(np.array(image['real']+image['real']*1j)).max()
-        imagestackReal = np.array(imagestackReal)/normScale
-        imagestackImag = np.array(imagestackImag)/normScale
-        
-    return imagestackReal+imagestackImag*1j
-
-class mriSliceDataset(Dataset):
-    def __init__(self, sample):
-        self.originalPath = []
-        self.accelPath = [] 
-
-        allImages = sorted(glob("/study/mrphys/skunkworks/training_data//mover01/*/", recursive=True))
-        folderName  = allImages[sample]
-        self.originalPath = folderName + 'processed_data/C.h5'
-        self.accelPath = folderName +'processed_data/acc_2min/C.h5'
-        
-        self.originalFile = getComplexSlices(self.originalPath)
-        self.accelFile = getComplexSlices(self.accelPath)
-
-    def __getitem__(self, index):
-        if index<256:
-            return self.accelFile[:,index,:,:], self.originalFile[:,index,:,:]
-        elif index<512:
-            index = index-256
-            return self.accelFile[:,:,index,:], self.originalFile[:,:,index,:]
-        else:
-            index = index-512
-            return self.accelFile[:,:,:,index], self.originalFile[:,:,:,index]
-        
-    def __len__(self):
-        return 768
+from mriDataset import mriSliceDataset
         
 # DDP SETUP
 
@@ -154,8 +109,8 @@ class Trainer:
     def _save(self, epoch):
         state_dict = self.model.module.state_dict()
         torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_LATEST.pth')
-        torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_ep{epoch}.pth')
-        with open(f'{self.parent_dir}/outputs/{self.name}/logs/{self.name}_logs.json', 'w') as f:
+        torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_ep{epoch:03d}.pth')
+        with open(f'{self.parent_dir}/outputs/{self.name}/logs/{self.name}_logs_GPU{self.gpu_id}.json', 'w') as f:
             json.dump(self.lossCounter, f)
         
     def _plot_loss(self, epoch):
@@ -165,7 +120,7 @@ class Trainer:
         plt.plot(epochs, tr_loss, label='train loss')
         plt.plot(epochs, te_loss, label='test loss')
         plt.legend()
-        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/lossPlot/{self.name}_LossPlot.png')
+        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/lossPlot/{self.name}_LossPlot_GPU{self.gpu_id}.png')
         plt.close()
         
     def _plot_sample(self, epoch):
@@ -188,10 +143,10 @@ class Trainer:
         for i in range(6):
             ax[2,i].imshow(torch.abs(fixedY[0,i]))
             ax[2,i].axis('off')
-        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_pred_{epoch}.png')
+        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_pred_{epoch:03d}.png')
         plt.close()
         
-    def train(self, epochs=100, lr_patience=10):
+    def train(self, epochs=200, lr_patience=10):
         best_loss = 1e10
         for epoch in range(epochs):
             self._epoch_run(epoch, training=True)
@@ -217,17 +172,24 @@ def prepare_dataloader(dataset, batch_size):
         sampler=DistributedSampler(dataset)
     )
                     
-def run(rank, world_size, folds=5, batch_size=32):
+def run(rank, world_size, folds=5, batch_size=32): 
     ddp_setup(rank, world_size)
+    allImages = sorted(glob("/study/mrphys/skunkworks/training_data//mover01/*/", recursive=True))
+    allImages = allImages[0:(len(allImages)//world_size)*world_size]
+    indices = [i*(len(allImages)//world_size) for i in range(world_size)]+[len(allImages)]
+    start = indices[rank]
+    end = indices[rank+1]-1
+    indices = [i for i in range(len(allImages)) if (i>=start)and(i<=end)]
     traintestData  = []
-    pbar = tqdm(range(len(allImages[0:40])), desc="loading datasets")
+    pbar = tqdm(indices, desc="loading datasets")
     for i in pbar:
         with open(f'/scratch/mrphys/pickled/dataset_{i}.pickle', 'rb') as f:
             data = pickle.load(f)
             traintestData.append(data)
-            del data      
+            del data  
     kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
     for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
+        print(f'Rank = {rank} -> Test Index = {[indices[i] for i in test_index]}')
         fold = i+1
         model = unet.UNet(
             10,
@@ -260,5 +222,9 @@ def run(rank, world_size, folds=5, batch_size=32):
     destroy_process_group()
                     
 if __name__=="__main__":
-    world_size = torch.cuda.device_count()//2
+    import argparse
+    parser = argparse.ArgumentParser(description='Param Parser')
+    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
+    args = parser.parse_args()
+    world_size = int(args.num_gpu)
     mp.spawn(run, args=(world_size,), nprocs=world_size)
