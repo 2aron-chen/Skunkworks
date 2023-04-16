@@ -17,39 +17,22 @@ from torchvision import transforms
 from torch.utils.data import Dataset
 from sklearn.model_selection import KFold as kf
 from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
-from torch.distributed import init_process_group, destroy_process_group
-import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
-from mriDataset import mriSliceDataset
-
 # Dataset
 T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
 samples = [p.split('/')[6] for p in T1path]
 class FullDataset(Dataset):   
     def __getitem__(self, index):
         if index<256:
-            return self.xgt[:,index,:,:], self.ymask[:,index,:,:]
+            return self.x[:,index,:,:], self.gt[:,index,:,:], self.y[:,index,:,:], self.mask[index,:,:]
         elif index<512:
             index = index-256
-            return self.xgt[:,:,index,:], self.ymask[:,:,index,:]
+            return self.x[:,:,index,:], self.gt[:,:,index,:], self.y[:,:,index,:], self.mask[:,index,:]
         else:
             index = index-512
-            return self.xgt[:,:,:,index], self.ymask[:,:,:,index]
+            return self.x[:,:,:,index], self.gt[:,:,:,index], self.y[:,:,:,index], self.mask[:,:,index]
     def __len__(self):
         return 768
         
-# DDP SETUP
-
-def ddp_setup(rank, world_size):
-    """
-    Args:
-        rank: Unique identifier of each process
-        world_size: Total number of processes
-    """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12369"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 class Trainer:
     def __init__(
@@ -68,9 +51,7 @@ class Trainer:
         }
         self.trainLoader, self.testLoader = loaders
         self.gpu_id = gpu_id
-        self.model = model
-        self.model.denoiser = DDP(model.denoiser.to(gpu_id), device_ids=[gpu_id])
-        self.model.T1Predictor = DDP(model.T1Predictor.to(gpu_id), device_ids=[gpu_id])
+        self.model = model.to(gpu_id)
         self.fixed_data = fixed_data
         self.norm_scale = norm_scale
         self.parent_dir = parent_dir
@@ -83,11 +64,11 @@ class Trainer:
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/preds', exist_ok=True)
         
     def _batch_run(self, data, training=True):
-        xgt, ymask = data
-        x = xgt[:,0:10].to(self.gpu_id)
-        gt = xgt[:,10:20].to(self.gpu_id)
-        y = ymask[:,0:1].to(self.gpu_id)
-        mask = ymask[:,1:2].to(self.gpu_id)
+        x, gt, y, mask = data
+        x = x.to(self.gpu_id)
+        gt = gt.to(self.gpu_id)
+        y = y.to(self.gpu_id)
+        mask = mask.to(self.gpu_id)
         if training:
             self.model.train()
         else:
@@ -99,7 +80,6 @@ class Trainer:
     def _epoch_run(self, epoch, training=True):
         word = 'Training' if training else 'Testing'
         loader = self.trainLoader if training else self.testLoader
-        loader.sampler.set_epoch(epoch)
         if not epoch in self.lossCounter[word].keys():
             self.lossCounter[word][epoch] = {
                 'counter':1e-7,
@@ -117,13 +97,13 @@ class Trainer:
             for lossname in losses.keys():
                 self.lossCounter[word][epoch]['loss'][lossname] += losses[lossname].item()*count
                 meanLoss = self.lossCounter[word][epoch]['loss'][lossname]/self.lossCounter[word][epoch]['counter']
-                lossmsg += f"{lossname} = {round(meanLoss,6)} "
-            pbar.set_description(f"[GPU #{self.gpu_id}] {word} Epoch : {epoch} [batch {i+1}/{len(loader)}] - {lossmsg}")
+                lossmsg += f"{lossname} = {round(meanLoss,4)} "
+            pbar.set_description(f"[GPU #{self.gpu_id}] {word} Epoch : {epoch} [batch {i+1}/{len(loader)}] - {lossmsg.strip()}")
         if training:
             self._save(epoch)
     
     def _save(self, epoch):
-        state_dict = self.model.module.state_dict()
+        state_dict = self.model.state_dict()
         torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_LATEST.pth')
         torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_ep{epoch:03d}.pth')
         with open(f'{self.parent_dir}/outputs/{self.name}/logs/{self.name}_logs_GPU{self.gpu_id}.json', 'w') as f:
@@ -141,11 +121,7 @@ class Trainer:
             plt.close()
         
     def _plot_sample(self, epoch):
-        xgt, ymask = self.fixed_data
-        x = xgt[0:10]
-        gt = xgt[10:20]
-        y = ymask[0:1]
-        mask = ymask[1:2]
+        x, gt, y, mask = self.fixed_data
         x = torch.unsqueeze(torch.tensor(x),0).to(gpu_id)
         gt = torch.unsqueeze(torch.tensor(gt),0).to(gpu_id)
         y = torch.unsqueeze(torch.tensor(y),0).to(gpu_id)
@@ -192,7 +168,7 @@ class Trainer:
         plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_T1_pred_{epoch}.png')
         plt.close()
         
-    def train(self, epochs=200, lr_patience=10):
+    def train(self, epochs=100, lr_patience=10):
         best_loss_t = 1e10
         best_loss_d = 1e10
         for epoch in range(epochs):
@@ -205,7 +181,7 @@ class Trainer:
             last_loss_d = self.lossCounter['Testing'][epoch]['loss']["l2_denoiser"]/self.lossCounter['Testing'][epoch]['counter']
             
             if best_loss_t+best_loss_d > last_loss_t+last_loss_d:
-                torch.save(self.model.module.state_dict(), f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_BEST.pth')
+                torch.save(self.model.state_dict(), f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_BEST.pth')
             
             if best_loss_t > last_loss_t:
                 best_loss_t = last_loss_t
@@ -223,16 +199,15 @@ class Trainer:
                 if patienceCounter_d>=lr_patience and self.model.D_scheduler.get_last_lr()[-1]>=self.model.min_lr:
                     self.model.D_scheduler.step()
                     
-def prepare_dataloader(dataset, batch_size, shuffle, world_size, rank):
+def prepare_dataloader(dataset, batch_size, shuffle):
     return DataLoader(
         dataset,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=False,
-        sampler=DistributedSampler(dataset,num_replicas=world_size,rank=rank,shuffle=shuffle,seed=69420)
+        shuffle=shuffle,
     )
     
-class fullModel:
+class fullModel(nn.Module):
 
     def __init__(self, n_chans=10, norm_scale=1.0, bkg_lambda=0.1, lr=1e-3):
         super(fullModel, self).__init__()
@@ -273,24 +248,8 @@ class fullModel:
         self.norm_scale = norm_scale
         self.bkg_lambda = bkg_lambda
         self.min_lr = lr/1000
-        self.training = True
-        
-    def get_ssim(self, pred, true):
-        ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
-        ssim_loss_imag = (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
-        return ssim_loss_real+ssim_loss_imag
-    
-    def train(self):
-        self.T1Predictor.train()
-        self.denoiser.train()
-        self.training = True
-        
-    def eval(self):
-        self.T1Predictor.eval()
-        self.denoiser.eval()
-        self.training = False   
 
-    def __call__(self, x, gt, y, mask):
+    def forward(self, x, gt, y, mask):
         mask[mask>0]=1.0
         mask[mask==0]=self.bkg_lambda
         # x = 2 minutes PCA
@@ -298,91 +257,72 @@ class fullModel:
         # y = T1
         if self.training:
             self.D_optimizer.zero_grad()
-            denoised_x = self.denoiser(x)
-            denoised_gt = self.denoiser(gt)
-            ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
-            ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
-            loss_d = ssim_loss_x+ssim_loss_gt
+            denoised = self.denoiser(x)
+            y_pred_denoised = torch.abs(self.T1Predictor(denoised))
+            ssim_loss_d = (1-ms_ssim(denoised.real, gt.real, data_range=self.norm_scale, size_average=False)).mean() + (1-ms_ssim(denoised.imag, gt.imag, data_range=self.norm_scale, size_average=False)).mean()
+            l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
+            loss_d = ssim_loss_d*10+l2_loss_d
             loss_d.backward()
             self.D_optimizer.step()
-            print('e')
-
+            
             self.T_optimizer.zero_grad()
-            y_pred_denoised = torch.abs(self.T1Predictor(denoised_x.detach()))
+            y_pred_denoised = torch.abs(self.T1Predictor(denoised.detach()))
             y_pred_gt = torch.abs(self.T1Predictor(gt))
-            l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
             l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
-            loss_t = l2_loss_gt + l2_loss_d
+            l2_loss_t = self.l2(y_pred_gt*mask, y*mask)
+            loss_t = l2_loss_t + l2_loss_d
             loss_t.backward()
             self.T_optimizer.step()
-            print('f')
 
             losses = {
-                "ssim":loss_d,
-                "l2_denoiser":l2_loss_d,
-                "l2_groundtruth":l2_loss_gt,
+                "ssim":ssim_loss_d,
+                "l2_denoiser":l2_loss_t,
+                "l2_groundtruth":l2_loss_d,
             }
-            preds = [denoised_x, y_pred_denoised, y_pred_gt]
+            preds = [denoised, y_pred_denoised, y_pred_gt]
         else:
             with torch.no_grad():
-                denoised_x = self.denoiser(x)
-                denoised_gt = self.denoiser(gt)
-                ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
-                ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
-                y_pred_denoised = torch.abs(self.T1Predictor(denoised_x))
+                denoised = self.denoiser(x)
+                y_pred_denoised = torch.abs(self.T1Predictor(denoised))
                 y_pred_gt = torch.abs(self.T1Predictor(gt))
-                l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
+
+                ssim_loss_d = (1-ms_ssim(denoised.real, gt.real, data_range=self.norm_scale, size_average=False)).mean() + (1-ms_ssim(denoised.imag, gt.imag, data_range=self.norm_scale, size_average=False)).mean()
                 l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
+                l2_loss_t = self.l2(y_pred_gt*mask, y*mask)
 
                 losses = {
-                    "ssim":loss_d,
-                    "l2_denoiser":l2_loss_d,
-                    "l2_groundtruth":l2_loss_gt,
+                    "ssim":ssim_loss_d,
+                    "l2_denoiser":l2_loss_t,
+                    "l2_groundtruth":l2_loss_d,
                 }
-                preds = [denoised_x, y_pred_denoised, y_pred_gt]
+                preds = [denoised, y_pred_denoised, y_pred_gt]
 
         return preds, losses
-                
-                    
-def run(rank, world_size, name, epochs=100, batch_size=32, folds=5): 
-    ddp_setup(rank, world_size)
-    try:
-        traintestData = []
-        for i in tqdm(range(len(samples[0:5]))):
-            with open(f'/scratch/mrphys/pickled/fullDataset_{i}.pickle', 'rb') as f:
-                data = pickle.load(f)
-                traintestData.append(data)  
-        kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
-        for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
-            print(f'Rank = {rank} -> Test Index = {test_index}')
-            fold = i+1
-            trainData = [traintestData[i] for i in train_index]
-            testData = [traintestData[i] for i in test_index]
-            trainDataset = torch.utils.data.ConcatDataset(trainData)
-            testDataset = torch.utils.data.ConcatDataset(testData)
-            trainDataloader = prepare_dataloader(testDataset, batch_size, True, world_size, rank)
-            testDataloader = prepare_dataloader(testDataset, batch_size, False, world_size, rank)
-            fixed_data = testDataset[150]
-            trainer = Trainer(
-                fullModel(),
-                [trainDataloader, testDataloader],
-                f'fullModel_{fold}',
-                fixed_data,
-                gpu_id = rank,
-            )
-            trainer.train()
-    except Exception as e:
-        print('Error occured : '+ str(e))
-    finally:
-        destroy_process_group()
                     
 if __name__=="__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='Param Parser')
-    parser.add_argument('--name', help='model name', default='fullModel')
-    parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
-    parser.add_argument('--batchsize', help='batch size of training and testing data', default=32, type=int)
-    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count()//2, type=int)
-    args = parser.parse_args()
-    print(f'Training model "{args.name}" at batch = {int(args.batchsize)} using {int(args.num_gpu)} gpus for {int(args.epochs)} epochs!') 
-    mp.spawn(run, args=(int(args.num_gpu), args.name, int(args.epochs), int(args.batchsize)), nprocs=int(args.num_gpu))
+    rank = 7
+    folds = 5
+    batch_size = 32
+    traintestData = []
+    for i in tqdm(range(len(samples[0:5]))):
+        with open(f'/scratch/mrphys/pickled/fullDataset_{i}.pickle', 'rb') as f:
+            data = pickle.load(f)
+            traintestData.append(data)  
+    kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420) 
+    for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
+        fold = i+1
+        trainData = [traintestData[i] for i in train_index]
+        testData = [traintestData[i] for i in test_index]
+        trainDataset = torch.utils.data.ConcatDataset(trainData)
+        testDataset = torch.utils.data.ConcatDataset(testData)
+        trainDataloader = prepare_dataloader(testDataset, batch_size, True)
+        testDataloader = prepare_dataloader(testDataset, batch_size, False)
+        fixed_data = testDataset[150]
+        trainer = Trainer(
+            fullModel(),
+            [trainDataloader, testDataloader],
+            f'fullModel_{fold}',
+            fixed_data,
+            gpu_id = rank,
+        )
+        trainer.train()
