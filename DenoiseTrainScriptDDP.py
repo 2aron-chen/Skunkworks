@@ -69,23 +69,24 @@ class Trainer:
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/lossPlot', exist_ok=True)
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/preds', exist_ok=True)
         
+    def get_ssim(self, pred, true):
+        loss = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean() + (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
+        return loss
+        
     def _batch_run(self, source, target, training=True):
         if training:
             self.model.train()
             self.optimizer.zero_grad()
-            output = self.model(source)
-            output = torch.sigmoid(output)
-            target = torch.sigmoid(target)
-            loss = (1-ms_ssim(output.real, target.real, data_range=self.norm_scale, size_average=False)).mean() + (1-ms_ssim(output.imag, target.imag, data_range=self.norm_scale, size_average=False)).mean()
-            loss.backward()
+            true = torch.sigmoid(target)
+            loss = self.get_ssim(torch.sigmoid(self.model(source)), true) + self.get_ssim(torch.sigmoid(self.model(target)), true)
+            loss.backward() 
             self.optimizer.step()
         else:
             with torch.no_grad():
                 self.model.eval()
                 output = self.model(source)
-                output = torch.sigmoid(output)
-                target = torch.sigmoid(target)
-                loss = (1-ms_ssim(output.real, target.real, data_range=self.norm_scale, size_average=False)).mean() + (1-ms_ssim(output.imag, target.imag, data_range=self.norm_scale, size_average=False)).mean()
+                true = torch.sigmoid(target)
+                loss = self.get_ssim(torch.sigmoid(self.model(source)), true) + self.get_ssim(torch.sigmoid(self.model(target)), true)
         return loss.item()
     
     def _epoch_run(self, epoch, training=True):
@@ -222,7 +223,7 @@ def run(rank, world_size, epochs, folds=5, batch_size=32):
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Param Parser')
-    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
+    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count()//2, type=int)
     parser.add_argument('--epochs', help='number of epochs', default=50, type=int)
     args = parser.parse_args()
     world_size = int(args.num_gpu)

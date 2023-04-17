@@ -54,13 +54,15 @@ def ddp_setup(rank, world_size):
 class Trainer:
     def __init__(
         self,
-        model,
+        models,
         loaders,
         name,
         fixed_data,
         parent_dir='/study/mrphys/skunkworks/kk',
         gpu_id=0,
         norm_scale = 1,
+        bkg_lambda = 0.1,
+        lr=1e-3,
     ):
         self.lossCounter = {
             'Training':{},
@@ -68,9 +70,17 @@ class Trainer:
         }
         self.trainLoader, self.testLoader = loaders
         self.gpu_id = gpu_id
-        self.model = model
-        self.model.denoiser = DDP(model.denoiser.to(gpu_id), device_ids=[gpu_id])
-        self.model.T1Predictor = DDP(model.T1Predictor.to(gpu_id), device_ids=[gpu_id])
+        self.denoiser, self.T1Predictor = models
+        self.denoiser = DDP(self.denoiser.to(gpu_id), device_ids=[gpu_id])
+        self.T1Predictor = DDP(self.T1Predictor.to(gpu_id), device_ids=[gpu_id])
+        self.D_optimizer = torch.optim.Adam(self.denoiser.parameters(), lr=lr)
+        self.D_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.D_optimizer, gamma=0.5)
+        self.T_optimizer = torch.optim.Adam(self.T1Predictor.parameters(), lr=lr)
+        self.T_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.T_optimizer, gamma=0.5)
+        self.l2 = nn.MSELoss()
+        self.bkg_lambda = bkg_lambda
+        self.min_lr = lr/1000
+        self.training = True
         self.fixed_data = fixed_data
         self.norm_scale = norm_scale
         self.parent_dir = parent_dir
@@ -82,17 +92,73 @@ class Trainer:
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/lossPlot', exist_ok=True)
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/preds', exist_ok=True)
         
+    def get_ssim(self, pred, true):
+        ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
+        ssim_loss_imag = (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
+        return ssim_loss_real+ssim_loss_imag
+        
+    def __call__(self, x, gt, y, mask, training=False):
+        mask[mask>0]=1.0
+        mask[mask==0]=self.bkg_lambda
+        # x = 2 minutes PCA
+        # gt = 9 minutes PCA
+        # y = T1
+        if training:
+            self.denoiser.train()
+            self.T1Predictor.train()
+            self.D_optimizer.zero_grad()
+            denoised_x = self.denoiser(x)
+            denoised_gt = self.denoiser(gt)
+            ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
+            ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
+            loss_d = ssim_loss_x+ssim_loss_gt
+            #loss_d.backward()
+            #self.D_optimizer.step()
+
+            self.T_optimizer.zero_grad()
+            y_pred_denoised = torch.abs(self.T1Predictor(denoised_x.detach()))
+            y_pred_gt = torch.abs(self.T1Predictor(gt))
+            l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
+            l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
+            loss_t = l2_loss_gt + l2_loss_d
+            loss_t.backward()
+            self.T_optimizer.step()
+
+            losses = {
+                "ssim":loss_d,
+                "l2_denoiser":l2_loss_d,
+                "l2_groundtruth":l2_loss_gt,
+            }
+            preds = [denoised_x, y_pred_denoised, y_pred_gt]
+        else:
+            self.denoiser.eval()
+            self.T1Predictor.eval()
+            with torch.no_grad():
+                denoised_x = self.denoiser(x)
+                denoised_gt = self.denoiser(gt)
+                ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
+                ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
+                y_pred_denoised = torch.abs(self.T1Predictor(denoised_x))
+                y_pred_gt = torch.abs(self.T1Predictor(gt))
+                l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
+                l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
+
+                losses = {
+                    "ssim":loss_d,
+                    "l2_denoiser":l2_loss_d,
+                    "l2_groundtruth":l2_loss_gt,
+                }
+                preds = [denoised_x, y_pred_denoised, y_pred_gt]
+
+        return preds, losses
+        
     def _batch_run(self, data, training=True):
         xgt, ymask = data
         x = xgt[:,0:10].to(self.gpu_id)
         gt = xgt[:,10:20].to(self.gpu_id)
         y = ymask[:,0:1].to(self.gpu_id)
         mask = ymask[:,1:2].to(self.gpu_id)
-        if training:
-            self.model.train()
-        else:
-            self.model.eval()
-        preds, losses = self.model(x, gt, y, mask)
+        preds, losses = self(x, gt, y, mask, training)
         del preds
         return losses, x.shape[0]
     
@@ -119,8 +185,8 @@ class Trainer:
                 meanLoss = self.lossCounter[word][epoch]['loss'][lossname]/self.lossCounter[word][epoch]['counter']
                 lossmsg += f"{lossname} = {round(meanLoss,6)} "
             pbar.set_description(f"[GPU #{self.gpu_id}] {word} Epoch : {epoch} [batch {i+1}/{len(loader)}] - {lossmsg}")
-        if training:
-            self._save(epoch)
+#         if training:
+#             self._save(epoch)
     
     def _save(self, epoch):
         state_dict = self.model.module.state_dict()
@@ -151,7 +217,7 @@ class Trainer:
         y = torch.unsqueeze(torch.tensor(y),0).to(gpu_id)
         mask = torch.unsqueeze(torch.tensor(mask),0).to(gpu_id)
         self.model.eval()
-        (denoised, y_pred_denoised, y_pred_gt), _ = self.model([x,gt,y,mask])
+        (denoised, y_pred_denoised, y_pred_gt), _ = self([x,gt,y,mask])
         
         # plot denoiser's progress
         x = x.cpu()
@@ -231,120 +297,8 @@ def prepare_dataloader(dataset, batch_size, shuffle, world_size, rank):
         shuffle=False,
         sampler=DistributedSampler(dataset,num_replicas=world_size,rank=rank,shuffle=shuffle,seed=69420)
     )
-    
-class fullModel:
-
-    def __init__(self, n_chans=10, norm_scale=1.0, bkg_lambda=0.1, lr=1e-3):
-        super(fullModel, self).__init__()
-
-        self.denoiser = unet.UNet(
-            n_chans,
-            n_chans,
-            f_maps=32,
-            layer_order=['separable convolution', 'relu'],
-            depth=4,
-            layer_growth=2.0,
-            residual=True,
-            complex_input=True,
-            complex_kernel=True,
-            ndims=2,
-            padding=1
-        )
-        self.D_optimizer = torch.optim.Adam(self.denoiser.parameters(), lr=lr)
-        self.D_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.D_optimizer, gamma=0.5)
-
-        self.T1Predictor = unet.UNet(
-            n_chans,
-            1,
-            f_maps=32,
-            layer_order=['separable convolution', 'batch norm', 'relu'],
-            depth=4,
-            layer_growth=2.0,
-            residual=True,
-            complex_input=True,
-            complex_kernel=True,
-            ndims=2,
-            padding=1
-        )
-        self.T_optimizer = torch.optim.Adam(self.T1Predictor.parameters(), lr=lr)
-        self.T_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.T_optimizer, gamma=0.5)
-
-        self.l2 = nn.MSELoss()
-        self.norm_scale = norm_scale
-        self.bkg_lambda = bkg_lambda
-        self.min_lr = lr/1000
-        self.training = True
-        
-    def get_ssim(self, pred, true):
-        ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
-        ssim_loss_imag = (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
-        return ssim_loss_real+ssim_loss_imag
-    
-    def train(self):
-        self.T1Predictor.train()
-        self.denoiser.train()
-        self.training = True
-        
-    def eval(self):
-        self.T1Predictor.eval()
-        self.denoiser.eval()
-        self.training = False   
-
-    def __call__(self, x, gt, y, mask):
-        mask[mask>0]=1.0
-        mask[mask==0]=self.bkg_lambda
-        # x = 2 minutes PCA
-        # gt = 9 minutes PCA
-        # y = T1
-        if self.training:
-            self.D_optimizer.zero_grad()
-            denoised_x = self.denoiser(x)
-            denoised_gt = self.denoiser(gt)
-            ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
-            ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
-            loss_d = ssim_loss_x+ssim_loss_gt
-            loss_d.backward()
-            self.D_optimizer.step()
-            print('e')
-
-            self.T_optimizer.zero_grad()
-            y_pred_denoised = torch.abs(self.T1Predictor(denoised_x.detach()))
-            y_pred_gt = torch.abs(self.T1Predictor(gt))
-            l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
-            l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
-            loss_t = l2_loss_gt + l2_loss_d
-            loss_t.backward()
-            self.T_optimizer.step()
-            print('f')
-
-            losses = {
-                "ssim":loss_d,
-                "l2_denoiser":l2_loss_d,
-                "l2_groundtruth":l2_loss_gt,
-            }
-            preds = [denoised_x, y_pred_denoised, y_pred_gt]
-        else:
-            with torch.no_grad():
-                denoised_x = self.denoiser(x)
-                denoised_gt = self.denoiser(gt)
-                ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),torch.sigmoid(gt))
-                ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),torch.sigmoid(gt))
-                y_pred_denoised = torch.abs(self.T1Predictor(denoised_x))
-                y_pred_gt = torch.abs(self.T1Predictor(gt))
-                l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
-                l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
-
-                losses = {
-                    "ssim":loss_d,
-                    "l2_denoiser":l2_loss_d,
-                    "l2_groundtruth":l2_loss_gt,
-                }
-                preds = [denoised_x, y_pred_denoised, y_pred_gt]
-
-        return preds, losses
-                
                     
-def run(rank, world_size, name, epochs=100, batch_size=32, folds=5): 
+def run(rank, world_size, name, epochs=100, batch_size=16, folds=5, n_chans=10): 
     ddp_setup(rank, world_size)
     try:
         traintestData = []
@@ -363,8 +317,34 @@ def run(rank, world_size, name, epochs=100, batch_size=32, folds=5):
             trainDataloader = prepare_dataloader(testDataset, batch_size, True, world_size, rank)
             testDataloader = prepare_dataloader(testDataset, batch_size, False, world_size, rank)
             fixed_data = testDataset[150]
+            denoiser = unet.UNet(
+                n_chans,
+                n_chans,
+                f_maps=32,
+                layer_order=['separable convolution', 'relu'],
+                depth=4,
+                layer_growth=2.0,
+                residual=True,
+                complex_input=True,
+                complex_kernel=True,
+                ndims=2,
+                padding=1
+            )
+            T1Predictor = unet.UNet(
+                n_chans,
+                1,
+                f_maps=32,
+                layer_order=['separable convolution', 'batch norm', 'relu'],
+                depth=4,
+                layer_growth=2.0,
+                residual=True,
+                complex_input=True,
+                complex_kernel=True,
+                ndims=2,
+                padding=1
+            )
             trainer = Trainer(
-                fullModel(),
+                [denoiser,T1Predictor],
                 [trainDataloader, testDataloader],
                 f'fullModel_{fold}',
                 fixed_data,
