@@ -5,7 +5,7 @@ from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
 class fullModel(nn.Module):
     
-    def __init__(self, nchans=10, norm_scale=1, bkg_lambda=0.1, ssim_lambda=1.0):
+    def __init__(self, nchans=10, norm_scale=1, bkg_lambda=1e-2, ssim_lambda=1.0):
         super(fullModel, self).__init__()
         self.denoiser = UNet(
             nchans,
@@ -22,7 +22,7 @@ class fullModel(nn.Module):
         )
         self.T1Predictor = UNet(
             nchans,
-            1,
+            2, # 1 - T1 mapping , 2 - mask
             f_maps=32,
             layer_order=['separable convolution', 'batch norm', 'relu'],
             depth=4,
@@ -36,6 +36,7 @@ class fullModel(nn.Module):
         self.norm_scale = norm_scale
         self.bkg_lambda = bkg_lambda
         self.l2 = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
         self.ssim_lambda = ssim_lambda
         
     def get_ssim(self, pred, true):
@@ -45,15 +46,28 @@ class fullModel(nn.Module):
         
     def forward(self, x, gt, y, mask):
         
-        mask[mask>0]=1.0
+        mask = mask.clone()
+        
+        mask[mask>0]=1.0-self.bkg_lambda
         mask[mask==0]=self.bkg_lambda
             
         # t1 predictor
         denoised_x = self.denoiser(x)
-        y_pred_denoised = torch.abs(self.T1Predictor(denoised_x))
-        y_pred_gt = torch.abs(self.T1Predictor(gt))
-        l2_loss_gt = self.l2(y_pred_gt*mask, y*mask)
-        l2_loss_d = self.l2(y_pred_denoised*mask, y*mask)
+        
+        denoised_pred = self.T1Predictor(denoised_x)
+        denoised_t1 = torch.abs(denoised_pred[:,0:1])
+        denoised_mask_logit = denoised_pred[:,1:2].real + denoised_pred[:,1:2].imag
+        
+        gt_pred = self.T1Predictor(gt)
+        gt_t1 = torch.abs(gt_pred[:,0:1])
+        gt_mask_logit = gt_pred[:,1:2].real + gt_pred[:,1:2].imag
+        
+        # mask BCE loss
+        mask_loss = (self.bce(denoised_mask_logit, mask) + self.bce(gt_mask_logit, mask))/2
+        
+        # t1 l2 loss     
+        l2_loss_gt = self.l2(gt_t1*(torch.sigmoid(denoised_mask_logit)).to(mask.dtype), y*mask)
+        l2_loss_d = self.l2(denoised_t1*(torch.sigmoid(gt_mask_logit)).to(mask.dtype), y*mask)
         
         # denoiser
         denoised_gt = self.denoiser(gt)
@@ -63,14 +77,15 @@ class fullModel(nn.Module):
         ssim_loss = ssim_loss_x+ssim_loss_gt
         
         # final loss
-        loss = ssim_loss*self.ssim_lambda + l2_loss_d + l2_loss_gt
+        loss = ssim_loss*self.ssim_lambda + l2_loss_d + l2_loss_gt + mask_loss
         
         losses = {
             "ssim":ssim_loss,
             "l2_denoiser":l2_loss_d,
             "l2_groundtruth":l2_loss_gt,
+            "mask":mask_loss,
             "total":loss,
         }
-        preds = [denoised_x, y_pred_denoised, y_pred_gt]
+        preds = [denoised_x, denoised_t1, gt_t1, denoised_mask_logit, gt_mask_logit]
         
         return preds, losses, loss

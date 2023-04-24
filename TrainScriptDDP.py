@@ -22,22 +22,6 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from mriDataset import mriSliceDataset
-
-# Dataset
-T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
-samples = [p.split('/')[6] for p in T1path]
-class FullDataset(Dataset):   
-    def __getitem__(self, index):
-        if index<256:
-            return self.xgt[:,index,:,:], self.ymask[:,index,:,:]
-        elif index<512:
-            index = index-256
-            return self.xgt[:,:,index,:], self.ymask[:,:,index,:]
-        else:
-            index = index-512
-            return self.xgt[:,:,:,index], self.ymask[:,:,:,index]
-    def __len__(self):
-        return 768
         
 # DDP SETUP
 
@@ -119,19 +103,21 @@ class Trainer:
                     "ssim":0.0,
                     "l2_denoiser":0.0,
                     "l2_groundtruth":0.0,
+                    "mask":0.0,
                     "total":0.0,
                 },
             }   
-        pbar = tqdm(enumerate(loader))
+        pbar = tqdm(enumerate(loader)) if self.gpu_id == 0 else enumerate(loader)
         for i, data in pbar:
             losses, count = self._batch_run(data, training=training)
             self.lossCounter[word][epoch]['counter'] += count
-            lossmsg = "[s/d/gt/t] = "
+            lossmsg = "[s/d/gt/m/t] = "
             for lossname in losses.keys():
                 self.lossCounter[word][epoch]['loss'][lossname] += losses[lossname].item()*count
                 meanLoss = self.lossCounter[word][epoch]['loss'][lossname]/self.lossCounter[word][epoch]['counter']
-                lossmsg += f"[{round(meanLoss,6)}]"
-            pbar.set_description(f"[GPU #{self.gpu_id}] {word} Epoch : {epoch} [batch {i+1}/{len(loader)}] - {lossmsg}")
+                lossmsg += f"[{round(meanLoss,5)}]"
+            if self.gpu_id == 0:
+                pbar.set_description(f"[GPU #{self.gpu_id}] {word} [ e {epoch} b {i+1}/{len(loader)}] - {lossmsg}")
         if training:
             self._save(epoch)
     
@@ -165,7 +151,7 @@ class Trainer:
         mask = torch.unsqueeze(torch.tensor(mask),0).to(self.gpu_id)
         with torch.no_grad():
             self.model.eval()
-            (denoised, y_pred_denoised, y_pred_gt), _, _ = self.model(x,gt,y,mask)
+            (denoised, y_pred_denoised, y_pred_gt, mask_d_logit, mask_gt_logit), _, _ = self.model(x,gt,y,mask)
         
         # plot denoiser's progress
         x = x.cpu()
@@ -190,19 +176,23 @@ class Trainer:
         y_pred_denoised = y_pred_denoised.cpu()
         y_pred_gt = y_pred_gt.cpu()
         y = y.cpu()
-        fig, ax = plt.subplots(2, 3, figsize=(9,6))
+        fig, ax = plt.subplots(2, 4, figsize=(12,6))
         ax[0,0].imshow(torch.abs(x[0,0]))
         ax[0,0].axis('off')
         ax[0,1].imshow(torch.abs(y_pred_denoised[0,0]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
         ax[0,1].axis('off')
         ax[0,2].imshow(torch.abs(y[0,0]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
         ax[0,2].axis('off')
+        ax[0,3].imshow(torch.sigmoid(mask_d_logit.cpu()[0,0]), vmin=0, vmax=1)
+        ax[0,3].axis('off')
         ax[1,0].imshow(torch.abs(gt[0,0]))
         ax[1,0].axis('off')
         ax[1,1].imshow(torch.abs(y_pred_gt[0,0]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
         ax[1,1].axis('off')
         ax[1,2].imshow(torch.abs(y[0,0]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
         ax[1,2].axis('off')
+        ax[1,3].imshow(torch.sigmoid(mask_gt_logit.cpu()[0,0]), vmin=0, vmax=1)
+        ax[1,3].axis('off')
         plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_T1_pred_{epoch:03d}.png')
         plt.close()
         
@@ -234,14 +224,44 @@ def prepare_dataloader(dataset, batch_size, shuffle, world_size, rank):
         sampler=DistributedSampler(dataset,num_replicas=world_size,rank=rank,shuffle=shuffle,seed=69420)
     )
                     
-def run(rank, world_size, name, epochs=100, batch_size=16, folds=5, nchans=10): 
+def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, num_samples=65, folds=5, nchans=10): 
     ddp_setup(rank, world_size)
     try:
         traintestData = []
-        for i in tqdm(range(len(samples[0:35]))):
-            with open(f'/scratch/mrphys/pickled/fullDataset_{i}.pickle', 'rb') as f:
-                data = pickle.load(f)
-                traintestData.append(data)  
+        if not precomputed:
+            T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
+            samples = [p.split('/')[6] for p in T1path]
+            class FullDataset(Dataset):   
+                def __getitem__(self, index):
+                    if index<256:
+                        return self.xgt[:,index,:,:], self.ymask[:,index,:,:]
+                    elif index<512:
+                        index = index-256
+                        return self.xgt[:,:,index,:], self.ymask[:,:,index,:]
+                    else:
+                        index = index-512
+                        return self.xgt[:,:,:,index], self.ymask[:,:,:,index]
+                def __len__(self):
+                    return 768
+            for i in tqdm(range(len(samples[0:num_samples]))):
+                with open(f'/scratch/mrphys/pickled/fullDataset_{i}.pickle', 'rb') as f:
+                    data = pickle.load(f)
+                    traintestData.append(data)  
+        else:
+            T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
+            samples = [p.split('/')[6] for p in T1path]
+            class FullDataset(Dataset):
+                def __init__(self, index, norm_factor=1000):
+                    self.name = samples[index]
+                def __getitem__(self, index):
+                    x, y, gt, mask = np.load(f'/scratch/mrphys/fullDataset/{self.name}/{index}.npy', allow_pickle=True)
+                    return np.concatenate([x,gt],axis=0), np.concatenate([y, np.expand_dims(mask,0)],axis=0)
+                def __len__(self):
+                    return 768
+            for i in tqdm(range(len(samples[0:num_samples]))):
+                data = FullDataset(i)
+                traintestData.append(data)
+                    
         kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
         for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
             print(f'Rank = {rank} -> Test Index = {test_index}')
@@ -273,6 +293,11 @@ if __name__=="__main__":
     parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=32, type=int)
     parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count()//2, type=int)
+    parser.add_argument('--precomputed', help='use precomputed numpy', default=1, type=int)
+    parser.add_argument('--samples', help='number of samples', default=65, type=int)
     args = parser.parse_args()
+    precomputed = bool(args.precomputed)
+    samples = int(args.samples)
     print(f'Training model "{args.name}" at batch = {int(args.batchsize)} using {int(args.num_gpu)} gpus for {int(args.epochs)} epochs!') 
-    mp.spawn(run, args=(int(args.num_gpu), args.name, int(args.epochs), int(args.batchsize)), nprocs=int(args.num_gpu))
+    print(f'Use precomputed values = {precomputed} on {samples} samples!')
+    mp.spawn(run, args=(int(args.num_gpu), args.name, int(args.epochs), int(args.batchsize), precomputed, samples), nprocs=int(args.num_gpu))
