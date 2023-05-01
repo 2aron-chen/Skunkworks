@@ -549,7 +549,6 @@ class UNet(nn.Module):
 
         self.crop_amount = crop_amount[:-1]
         self.encoders = nn.ModuleList(encoders)
-        print(f'Crop amount {self.crop_amount}')
 
         # create decoder path consisting of the Decoder modules. The length of the decoder is equal to `len(f_maps) - 1`
         # uses DoubleConv as a basic_module for the Decoder

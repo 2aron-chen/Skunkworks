@@ -5,7 +5,7 @@ from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
 class fullModel(nn.Module):
     
-    def __init__(self, nchans=10, norm_scale=1, bkg_lambda=1e-2, ssim_lambda=1.0):
+    def __init__(self, nchans=10, norm_scale=1, bkg_lambda=1e-2, ssim_lambda=0.1):
         super(fullModel, self).__init__()
         self.denoiser = UNet(
             nchans,
@@ -35,7 +35,6 @@ class fullModel(nn.Module):
         )
         self.norm_scale = norm_scale
         self.bkg_lambda = bkg_lambda
-        self.l2 = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
         self.ssim_lambda = ssim_lambda
         
@@ -43,12 +42,16 @@ class fullModel(nn.Module):
         ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
         ssim_loss_imag = (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
         return ssim_loss_real+ssim_loss_imag
+    
+    def get_error(self, pred, true):
+        mseDiff = torch.mean((pred-true)**2)
+        return mseDiff
         
     def forward(self, x, gt, y, mask):
         
         mask = mask.clone()
         
-        mask[mask>0]=1.0-self.bkg_lambda
+        mask[mask>0]=1.0
         mask[mask==0]=self.bkg_lambda
             
         # t1 predictor
@@ -66,8 +69,8 @@ class fullModel(nn.Module):
         mask_loss = (self.bce(denoised_mask_logit, mask) + self.bce(gt_mask_logit, mask))/2
         
         # t1 l2 loss     
-        l2_loss_gt = self.l2(gt_t1*(torch.sigmoid(denoised_mask_logit)).to(mask.dtype), y*mask)
-        l2_loss_d = self.l2(denoised_t1*(torch.sigmoid(gt_mask_logit)).to(mask.dtype), y*mask)
+        l2_loss_gt = self.get_error(gt_t1*(torch.sigmoid(denoised_mask_logit)).to(mask.dtype), y*mask)
+        l2_loss_d = self.get_error(denoised_t1*(torch.sigmoid(gt_mask_logit)).to(mask.dtype), y*mask)
         
         # denoiser
         denoised_gt = self.denoiser(gt)
@@ -81,8 +84,8 @@ class fullModel(nn.Module):
         
         losses = {
             "ssim":ssim_loss,
-            "l2_denoiser":l2_loss_d,
-            "l2_groundtruth":l2_loss_gt,
+            "error_denoiser":l2_loss_d,
+            "error_groundtruth":l2_loss_gt,
             "mask":mask_loss,
             "total":loss,
         }

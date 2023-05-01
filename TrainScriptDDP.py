@@ -22,6 +22,10 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from mriDataset import mriSliceDataset
+from smoothing import GaussianSmoothing
+
+import warnings
+warnings.filterwarnings("ignore")
         
 # DDP SETUP
 
@@ -58,7 +62,17 @@ class Trainer:
         self.model = DDP(self.model, device_ids=[gpu_id])
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.5)
-        
+        self.smoother = GaussianSmoothing(1, 10, 0.2, 2).to(gpu_id)
+        self.evaluations = {
+            1:{"% diff mean":[],"% diff sd":[],"% abs diff mean":[],"% abs diff sd":[]},
+            2:{"% diff mean":[],"% diff sd":[],"% abs diff mean":[],"% abs diff sd":[]},
+            3:{"% diff mean":[],"% diff sd":[],"% abs diff mean":[],"% abs diff sd":[]},
+        }
+        self.mapnames = {
+            1:"CSF",
+            2:"Gray Matter",
+            3:"White Matter",
+        }
         self.bkg_lambda = bkg_lambda
         self.min_lr = lr/1000
         self.training = True
@@ -73,12 +87,29 @@ class Trainer:
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/lossPlot', exist_ok=True)
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/preds', exist_ok=True)
         
-    def _batch_run(self, data, training=True):
+    def _evaluate(self, preds, trues, maps):
+        if maps is None:
+            return None
+        with torch.no_grad():
+            _, _, y_true, mask = trues
+            _, y_pred_denoised, _, mask_d_logit, _ = preds
+            y_pred_denoised = self.smoother((y_pred_denoised*torch.sigmoid(mask_d_logit)).float(), mask)
+            y_true = self.smoother(y_true.float(), mask)
+            for i in maps.keys():
+                condition = mask==i
+                y_pred_denoised_masked = y_pred_denoised[condition]
+                y_true_masked = y_true[condition]
+                maps[i]["denoised_t1"] += list(y_pred_denoised_masked.cpu().reshape(-1))
+                maps[i]["t1"] += list(y_true_masked.cpu().reshape(-1))
+        return maps
+        
+    def _batch_run(self, data, maps, training=True):
         xgt, ymask = data
         x = xgt[:,0:10].to(self.gpu_id)
         gt = xgt[:,10:20].to(self.gpu_id)
         y = ymask[:,0:1].to(self.gpu_id)
         mask = ymask[:,1:2].to(self.gpu_id)
+        trues = (x, gt, y, mask)
         if training:
             self.model.train()
             self.optimizer.zero_grad()
@@ -89,8 +120,8 @@ class Trainer:
             with torch.no_grad():
                 self.model.eval()
                 preds, losses, loss = self.model(x, gt, y, mask)
-        del preds
-        return losses, x.shape[0]
+        maps = self._evaluate(preds, trues, maps)
+        return losses, x.shape[0], maps
     
     def _epoch_run(self, epoch, training=True):
         word = 'Training' if training else 'Testing'
@@ -101,15 +132,20 @@ class Trainer:
                 'counter':1e-7,
                 'loss':{
                     "ssim":0.0,
-                    "l2_denoiser":0.0,
-                    "l2_groundtruth":0.0,
+                    "error_denoiser":0.0,
+                    "error_groundtruth":0.0,
                     "mask":0.0,
                     "total":0.0,
                 },
             }   
         pbar = tqdm(enumerate(loader)) if self.gpu_id == 0 else enumerate(loader)
+        maps = {
+            1:{"denoised_t1":[],"t1":[]},
+            2:{"denoised_t1":[],"t1":[]},
+            3:{"denoised_t1":[],"t1":[]},
+        } if not training else None
         for i, data in pbar:
-            losses, count = self._batch_run(data, training=training)
+            losses, count, maps = self._batch_run(data, maps, training=training)
             self.lossCounter[word][epoch]['counter'] += count
             lossmsg = "[s/d/gt/m/t] = "
             for lossname in losses.keys():
@@ -117,9 +153,41 @@ class Trainer:
                 meanLoss = self.lossCounter[word][epoch]['loss'][lossname]/self.lossCounter[word][epoch]['counter']
                 lossmsg += f"[{round(meanLoss,5)}]"
             if self.gpu_id == 0:
-                pbar.set_description(f"[GPU #{self.gpu_id}] {word} [ e {epoch} b {i+1}/{len(loader)}] - {lossmsg}")
+                pbar.set_description(f"[{word} [e={epoch}, b={i+1}/{len(loader)}] - {lossmsg}")
         if training:
             self._save(epoch)
+            
+        if not training:   
+            for i in maps.keys():
+                mapname = self.mapnames[i]
+                pred = np.array(maps[i]["denoised_t1"])
+                true = np.array(maps[i]["t1"])
+                diff = (pred-true)/true
+                self.evaluations[i]["% abs diff mean"] += [np.mean(np.abs(diff))*100]
+                self.evaluations[i]["% abs diff sd"] += [np.std(np.abs(diff))*100]
+                self.evaluations[i]["% diff mean"] += [np.mean(diff)*100]
+                self.evaluations[i]["% diff sd"] += [np.std(diff)*100]
+                
+                # diff mean   
+                mean = np.array(self.evaluations[i]["% diff mean"])
+                sd = np.array(self.evaluations[i]["% diff sd"])
+                plt.plot(mean, color='black', label="mean difference")
+                plt.fill_between(np.arange(len(mean)), mean-sd, mean+sd, color='blue', alpha=0.2, label='std difference')
+                plt.legend()
+                plt.title(f"{mapname} error plot (% difference)")
+                plt.savefig(f'{self.parent_dir}/outputs/{self.name}/logs/_PLOT_{self.name}_{mapname}_diff.png')
+                plt.close()
+                
+                mean = np.array(self.evaluations[i]["% abs diff mean"])
+                sd = np.array(self.evaluations[i]["% abs diff sd"])
+                plt.plot(mean, color='black', label="mean difference")
+                plt.fill_between(np.arange(len(mean)), mean-sd, mean+sd, color='blue', alpha=0.2, label='std difference')
+                plt.legend()
+                plt.title(f"{mapname} error plot (% difference)")
+                plt.savefig(f'{self.parent_dir}/outputs/{self.name}/logs/_PLOT_{self.name}_{mapname}_abs_diff.png')
+                plt.close()
+
+        del maps
     
     def _save(self, epoch):
         state_dict = self.model.module.state_dict()
@@ -127,6 +195,8 @@ class Trainer:
         torch.save(state_dict, f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_ep{epoch:03d}.pth')
         with open(f'{self.parent_dir}/outputs/{self.name}/logs/{self.name}_logs_GPU{self.gpu_id}.json', 'w') as f:
             json.dump(self.lossCounter, f)
+        with open(f'{self.parent_dir}/outputs/{self.name}/logs/{self.name}_evals_GPU{self.gpu_id}.json', 'w') as f:
+            json.dump(self.evaluations, f)
         
     def _plot_loss(self, epoch):
         for lossname in self.lossCounter['Training'][0]['loss'].keys():
@@ -196,7 +266,7 @@ class Trainer:
         plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_T1_pred_{epoch:03d}.png')
         plt.close()
         
-    def train(self, epochs=200, lr_patience=10):
+    def train(self, epochs=100, lr_patience=10):
         best_loss = 1e10
         patienceCounter = 0
         for epoch in range(epochs):
@@ -223,6 +293,19 @@ def prepare_dataloader(dataset, batch_size, shuffle, world_size, rank):
         shuffle=False,
         sampler=DistributedSampler(dataset,num_replicas=world_size,rank=rank,shuffle=shuffle,seed=69420)
     )
+
+class FullDataset(Dataset):   
+    def __getitem__(self, index):
+        if index<256:
+            return self.xgt[:,index,:,:], self.ymask[:,index,:,:]
+        elif index<512:
+            index = index-256
+            return self.xgt[:,:,index,:], self.ymask[:,:,index,:]
+        else:
+            index = index-512
+            return self.xgt[:,:,:,index], self.ymask[:,:,:,index]
+    def __len__(self):
+        return 768
                     
 def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, num_samples=65, folds=5, nchans=10): 
     ddp_setup(rank, world_size)
@@ -231,18 +314,6 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
         if not precomputed:
             T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
             samples = [p.split('/')[6] for p in T1path]
-            class FullDataset(Dataset):   
-                def __getitem__(self, index):
-                    if index<256:
-                        return self.xgt[:,index,:,:], self.ymask[:,index,:,:]
-                    elif index<512:
-                        index = index-256
-                        return self.xgt[:,:,index,:], self.ymask[:,:,index,:]
-                    else:
-                        index = index-512
-                        return self.xgt[:,:,:,index], self.ymask[:,:,:,index]
-                def __len__(self):
-                    return 768
             for i in tqdm(range(len(samples[0:num_samples]))):
                 with open(f'/scratch/mrphys/pickled/fullDataset_{i}.pickle', 'rb') as f:
                     data = pickle.load(f)
@@ -254,8 +325,8 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
                 def __init__(self, index, norm_factor=1000):
                     self.name = samples[index]
                 def __getitem__(self, index):
-                    x, y, gt, mask = np.load(f'/scratch/mrphys/fullDataset/{self.name}/{index}.npy', allow_pickle=True)
-                    return np.concatenate([x,gt],axis=0), np.concatenate([y, np.expand_dims(mask,0)],axis=0)
+                    x,y,gt,mask = np.load(f'/scratch/mrphys/fullDataset/{self.name}/{index}.npy', allow_pickle=True)
+                    return np.concatenate([x,gt],axis=0), np.concatenate([y, mask],axis=0)
                 def __len__(self):
                     return 768
             for i in tqdm(range(len(samples[0:num_samples]))):
@@ -264,7 +335,8 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
                     
         kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
         for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
-            print(f'Rank = {rank} -> Test Index = {test_index}')
+            if rank==0:
+                print(f'Train Index = {train_index}\nTest Index = {test_index}')
             fold = i+1
             trainData = [traintestData[i] for i in train_index]
             testData = [traintestData[i] for i in test_index]
@@ -276,11 +348,11 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
             trainer = Trainer(
                 fullModel(nchans=nchans),
                 [trainDataloader, testDataloader],
-                f'fullModel_{fold}',
+                f'{name}_{fold}',
                 fixed_data,
                 gpu_id = rank,
             )
-            trainer.train()
+            trainer.train(epochs = epochs)
     except Exception as e:
         print('Error occured : '+ str(e))
     finally:
