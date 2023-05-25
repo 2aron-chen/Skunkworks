@@ -5,12 +5,12 @@ from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
 class fullModel(nn.Module):
     
-    def __init__(self, nchans=10, norm_scale=1, bkg_lambda=1e-2, ssim_lambda=0.1):
+    def __init__(self, f=32, nchans=10, norm_scale=1, bkg_lambda=1e-2, ssim_lambda=0.1):
         super(fullModel, self).__init__()
         self.denoiser = UNet(
             nchans,
             nchans,
-            f_maps=32,
+            f_maps=f,
             layer_order=['separable convolution', 'relu'],
             depth=4,
             layer_growth=2.0,
@@ -23,7 +23,7 @@ class fullModel(nn.Module):
         self.T1Predictor = UNet(
             nchans,
             2, # 1 - T1 mapping , 2 - mask
-            f_maps=32,
+            f_maps=f,
             layer_order=['separable convolution', 'batch norm', 'relu'],
             depth=4,
             layer_growth=2.0,

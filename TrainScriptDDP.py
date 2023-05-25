@@ -346,7 +346,7 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
             testDataloader = prepare_dataloader(testDataset, batch_size, False, world_size, rank)
             fixed_data = testDataset[150]
             trainer = Trainer(
-                fullModel(nchans=nchans),
+                fullModel(f=16, nchans=nchans),
                 [trainDataloader, testDataloader],
                 f'{name}_{fold}',
                 fixed_data,
@@ -361,7 +361,7 @@ def run(rank, world_size, name, epochs=100, batch_size=16, precomputed=False, nu
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Param Parser')
-    parser.add_argument('--name', help='model name', default='fullModel')
+    parser.add_argument('--name', help='model name', default='fullModel_small')
     parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=32, type=int)
     parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count()//2, type=int)
