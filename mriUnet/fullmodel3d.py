@@ -5,7 +5,7 @@ from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
 class fullModel(nn.Module):
     
-    def __init__(self, f=32, nchans=10, norm_scale=1, bkg_lambda=0.0, ssim_lambda=0.1):
+    def __init__(self, f=16, nchans=10, norm_scale=1, bkg_lambda=0.0, ssim_lambda=0.1):
         super(fullModel, self).__init__()
         self.denoiser = UNet(
             nchans,
@@ -17,7 +17,7 @@ class fullModel(nn.Module):
             residual=True,
             complex_input=True,
             complex_kernel=True,
-            ndims=2,
+            ndims=3,
             padding=1
         )
         self.T1Predictor = UNet(
@@ -30,7 +30,7 @@ class fullModel(nn.Module):
             residual=True,
             complex_input=True,
             complex_kernel=True,
-            ndims=2,
+            ndims=3,
             padding=1
         )
         self.norm_scale = norm_scale
@@ -38,10 +38,18 @@ class fullModel(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
         self.ssim_lambda = ssim_lambda
         
-    def get_ssim(self, pred, true):
-        ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
-        ssim_loss_imag = (1-ms_ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=False)).mean()
+    def complex_2d_ssim(self, pred, true):
+        ssim_loss_real = (1-ssim(pred.real, true.real, data_range=self.norm_scale, size_average=True))
+        ssim_loss_imag = (1-ssim(pred.imag, true.imag, data_range=self.norm_scale, size_average=True))
         return ssim_loss_real+ssim_loss_imag
+
+    def complex_3d_ssim(self, pred_3d, true_3d):
+        total_loss = 0
+        for i in range(s):
+            total_loss += complex_2d_ssim(pred_3d[:,:,i], true_3d[:,:,i])
+            total_loss += complex_2d_ssim(pred_3d[:,:,:,i], true_3d[:,:,:,i])
+            total_loss += complex_2d_ssim(pred_3d[:,:,:,:,i], true_3d[:,:,:,:,i])
+        return total_loss
     
     def get_error(self, pred, true):
         mseDiff = torch.mean((pred-true)**2)

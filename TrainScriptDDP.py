@@ -36,7 +36,7 @@ def ddp_setup(rank, world_size):
         world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12369"
+    os.environ["MASTER_PORT"] = "42069"
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 class Trainer:
