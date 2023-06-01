@@ -364,7 +364,7 @@ if __name__=="__main__":
     parser.add_argument('--name', help='model name', default='fullModel_small')
     parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=32, type=int)
-    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count()//2, type=int)
+    parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
     parser.add_argument('--precomputed', help='use precomputed numpy', default=1, type=int)
     parser.add_argument('--samples', help='number of samples', default=65, type=int)
     args = parser.parse_args()
