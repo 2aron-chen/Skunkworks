@@ -5,7 +5,7 @@ from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
 class fullModel(nn.Module):
     
-    def __init__(self, f=32, nchans=10, norm_scale=1, bkg_lambda=0.0, ssim_lambda=0.1):
+    def __init__(self, f=32, nchans=10, norm_scale=1, bkg_lambda=0.0, ssim_lambda=0.1, noise_mode=False):
         super(fullModel, self).__init__()
         self.denoiser = UNet(
             nchans,
@@ -37,6 +37,7 @@ class fullModel(nn.Module):
         self.bkg_lambda = bkg_lambda
         self.bce = nn.BCEWithLogitsLoss()
         self.ssim_lambda = ssim_lambda
+        self.noise_mode = noise_mode
         
     def get_ssim(self, pred, true):
         ssim_loss_real = (1-ms_ssim(pred.real, true.real, data_range=self.norm_scale, size_average=False)).mean()
@@ -55,7 +56,10 @@ class fullModel(nn.Module):
         mask[mask==0]=self.bkg_lambda
             
         # t1 predictor
-        denoised_x = self.denoiser(x)
+        if not self.noise_mode:
+            denoised_x = self.denoiser(x)
+        else:
+            denoised_x = x - self.denoiser(x)
         
         denoised_pred = self.T1Predictor(denoised_x)
         denoised_t1 = torch.abs(denoised_pred[:,0:1])
@@ -73,8 +77,13 @@ class fullModel(nn.Module):
         l2_loss_d = self.get_error(denoised_t1*(torch.sigmoid(gt_mask_logit)).to(mask.dtype), y*mask)
         
         # denoiser
-        denoised_gt = self.denoiser(gt)
+        if not self.noise_mode:
+            denoised_gt = self.denoiser(gt)
+        else:
+            denoised_gt = gt - self.denoiser(gt)
+        x = torch.sigmoid(x)
         gt = torch.sigmoid(gt)
+        
         ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),gt)
         ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),gt)
         ssim_loss = ssim_loss_x+ssim_loss_gt
@@ -89,6 +98,9 @@ class fullModel(nn.Module):
             "mask":mask_loss,
             "total":loss,
         }
-        preds = [denoised_x, denoised_t1, gt_t1, denoised_mask_logit, gt_mask_logit]
+        if not self.noise_mode:
+            preds = [x-denoised_x, denoised_t1, gt_t1, denoised_mask_logit, gt_mask_logit]
+        else:
+            preds = [denoised_x, denoised_t1, gt_t1, denoised_mask_logit, gt_mask_logit]
         
         return preds, losses, loss

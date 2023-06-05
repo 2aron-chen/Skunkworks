@@ -45,10 +45,11 @@ class fullModel(nn.Module):
 
     def complex_3d_ssim(self, pred_3d, true_3d):
         total_loss = 0
+        s = pred_3d.shape[-1]
         for i in range(s):
-            total_loss += complex_2d_ssim(pred_3d[:,:,i], true_3d[:,:,i])
-            total_loss += complex_2d_ssim(pred_3d[:,:,:,i], true_3d[:,:,:,i])
-            total_loss += complex_2d_ssim(pred_3d[:,:,:,:,i], true_3d[:,:,:,:,i])
+            total_loss += self.complex_2d_ssim(pred_3d[:,:,i], true_3d[:,:,i])
+            total_loss += self.complex_2d_ssim(pred_3d[:,:,:,i], true_3d[:,:,:,i])
+            total_loss += self.complex_2d_ssim(pred_3d[:,:,:,:,i], true_3d[:,:,:,:,i])
         return total_loss
     
     def get_error(self, pred, true):
@@ -83,8 +84,8 @@ class fullModel(nn.Module):
         # denoiser
         denoised_gt = self.denoiser(gt)
         gt = torch.sigmoid(gt)
-        ssim_loss_x = self.get_ssim(torch.sigmoid(denoised_x),gt)
-        ssim_loss_gt = self.get_ssim(torch.sigmoid(denoised_gt),gt)
+        ssim_loss_x = self.complex_3d_ssim(torch.sigmoid(denoised_x),gt)
+        ssim_loss_gt = self.complex_3d_ssim(torch.sigmoid(denoised_gt),gt)
         ssim_loss = ssim_loss_x+ssim_loss_gt
         
         # final loss
