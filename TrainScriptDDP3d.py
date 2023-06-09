@@ -337,7 +337,7 @@ def run(rank, world_size, name, epochs=100, batch_size=1, num_samples=65, folds=
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Param Parser')
-    parser.add_argument('--name', help='model name', default='fullModel_3d')
+    parser.add_argument('--name', help='model name', default='3dModel')
     parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=1, type=int)
     parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
