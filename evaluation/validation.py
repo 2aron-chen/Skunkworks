@@ -26,7 +26,7 @@ wb_gt = []
 gm_gt = []
 wm_gt = []
 
-denoised_list_path = sorted(glob("/study/mrphys/skunkworks/kk/T1/*"))
+denoised_list_path = sorted(glob("/study/mrphys/skunkworks/kk/T1/T1_gt_*"))
 gt_list_path = sorted(glob("/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii"))
 mask_list_path = sorted(glob('/scratch/mrphys/fullDataset/*'))
 
