@@ -1,0 +1,14 @@
+num_alpha = 2
+N = 325
+N = 61
+alpha = 4.000000
+alpha = 8.000000
+beta = 180
+TR = 4.876000
+TI = 12
+TD = 504.876007
+disdaqs = 1
+end_disdaqs = 0
+bin_width = 1
+frame_spacing = 1
+frame_spacing = 1

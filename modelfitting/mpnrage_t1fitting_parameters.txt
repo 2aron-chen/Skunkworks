@@ -1,0 +1,19 @@
+N = 325
+M = 61
+num_imgs = 385
+
+TR = 4.876000
+TI = 12 0
+TD = 4.876000 504.876007
+
+alpha = 4.000000 8.000000
+beta = 180 0
+
+disdaqs = 1
+disdaq_frames = 1
+com_frames = -1
+
+rescale_data = 0
+mpnrage_sliding_bin_width = 0
+mpnrage_vfa_primary_frames = 325
+mpnrage_vfa_secondary_frames = 61
