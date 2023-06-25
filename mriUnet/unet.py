@@ -26,8 +26,7 @@ def conv(in_channels, out_channels, kernel_size, stride=1, padding=1, padding_mo
                                      padding_mode=padding_mode,
                                      dilation=dilation,
                                      groups=groups,
-                                     bias=bias,
-                                     ndims=ndims)
+                                     bias=bias)
     else:
         raise ValueError(f'Convolution  must be 2D or 3D passed {ndims}')
         

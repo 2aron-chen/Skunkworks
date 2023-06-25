@@ -11,8 +11,9 @@ from tqdm import tqdm
 from glob import glob
 import os
 import sys
+import nibabel as nib
 sys.path.insert(0,"/study/mrphys/skunkworks/kk/mriUnet")
-from fullmodel3d import fullModel
+from unet import UNet
 from torchvision import transforms
 from torch.utils.data import Dataset
 from sklearn.model_selection import KFold as kf
@@ -21,7 +22,6 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from mriDataset import mriSliceDataset
 from smoothing import GaussianSmoothing
 
 import warnings
@@ -48,9 +48,9 @@ class Trainer:
         fixed_data,
         parent_dir='/study/mrphys/skunkworks/kk',
         gpu_id=0,
-        norm_scale = 1,
-        bkg_lambda = 0.1,
+        bkg_lambda = 1e-4,
         lr=1e-3,
+        smoothen=False,
     ):
         self.lossCounter = {
             'Training':{},
@@ -62,7 +62,10 @@ class Trainer:
         self.model = DDP(self.model, device_ids=[gpu_id])
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.5)
-        self.smoother = GaussianSmoothing(1, 10, 0.2, 3).to(gpu_id)
+        if smoothen:
+            self.smoother = GaussianSmoothing(1, 1, 0.2, 3).to(gpu_id)
+        else:
+            self.smoother = nn.Identity()
         self.evaluations = {
             1:{"% diff mean":[],"% diff sd":[],"% abs diff mean":[],"% abs diff sd":[]},
             2:{"% diff mean":[],"% diff sd":[],"% abs diff mean":[],"% abs diff sd":[]},
@@ -77,7 +80,6 @@ class Trainer:
         self.min_lr = lr/1000
         self.training = True
         self.fixed_data = fixed_data
-        self.norm_scale = norm_scale
         self.parent_dir = parent_dir
         self.name = name
         #make directories for checkpoint
@@ -87,41 +89,47 @@ class Trainer:
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/lossPlot', exist_ok=True)
         os.makedirs(f'{self.parent_dir}/outputs/{self.name}/preds', exist_ok=True)
         
-    def _evaluate(self, preds, trues, maps):
+        self.mse = nn.MSELoss()
+        
+    def _evaluate(self, pred, true, mask, maps):
         if maps is None:
             return None
         with torch.no_grad():
-            _, _, y_true, mask = trues
-            _, y_pred_denoised, _, mask_d_logit, _ = preds
-            y_pred_denoised = self.smoother((y_pred_denoised*torch.sigmoid(mask_d_logit)).float(), mask)
-            y_true = self.smoother(y_true.float(), mask)
             for i in maps.keys():
                 condition = mask==i
-                y_pred_denoised_masked = y_pred_denoised[condition]
-                y_true_masked = y_true[condition]
-                maps[i]["denoised_t1"] += list(y_pred_denoised_masked.cpu().reshape(-1))
-                maps[i]["t1"] += list(y_true_masked.cpu().reshape(-1))
+                pred_masked = pred[condition]
+                true_masked = true[condition]
+                maps[i]["denoised_t1"] += list(pred_masked.cpu().reshape(-1))
+                maps[i]["t1"] += list(true_masked.cpu().reshape(-1))
         return maps
         
     def _batch_run(self, data, maps, training=True):
-        x, gt, y, mask = data
-        x = x.to(self.gpu_id)
-        gt = gt.to(self.gpu_id)
-        y = y.to(self.gpu_id)
-        mask = mask.to(self.gpu_id)
-        trues = (x, gt, y, mask)
+        X, Y, mask = data
+        M = torch.clone(mask)
+        M[M!=0] = 1.0
+        M[M==0] = self.bkg_lambda
+        M = M.to(self.gpu_id).float()
+        
+        X = X.to(self.gpu_id).float()*M
+        Y = Y.to(self.gpu_id).float()*M
         if training:
             self.model.train()
             self.optimizer.zero_grad()
-            preds, losses, loss = self.model(x, gt, y, mask)
+            pred = self.model(X)
+            loss = self.mse(self.smoother(pred), self.smoother(Y))
             loss.backward()
             self.optimizer.step()
         else:
             with torch.no_grad():
                 self.model.eval()
-                preds, losses, loss = self.model(x, gt, y, mask)
-        maps = self._evaluate(preds, trues, maps)
-        return losses, x.shape[0], maps
+                pred = self.model(X)
+                loss = self.mse(self.smoother(pred), self.smoother(Y))
+
+        maps = self._evaluate(self.smoother(pred), self.smoother(Y), mask, maps)
+        losses = {
+            "MSELoss":loss
+        }
+        return losses, X.shape[0], maps
     
     def _epoch_run(self, epoch, training=True):
         word = 'Training' if training else 'Testing'
@@ -131,11 +139,7 @@ class Trainer:
             self.lossCounter[word][epoch] = {
                 'counter':1e-7,
                 'loss':{
-                    "ssim":0.0,
-                    "error_denoiser":0.0,
-                    "error_groundtruth":0.0,
-                    "mask":0.0,
-                    "total":0.0,
+                    "MSELoss":0.0
                 },
             }   
         pbar = tqdm(enumerate(loader)) if self.gpu_id == 0 else enumerate(loader)
@@ -147,7 +151,7 @@ class Trainer:
         for i, data in pbar:
             losses, count, maps = self._batch_run(data, maps, training=training)
             self.lossCounter[word][epoch]['counter'] += count
-            lossmsg = "[s/d/gt/m/t] = "
+            lossmsg = "Losses = "
             for lossname in losses.keys():
                 self.lossCounter[word][epoch]['loss'][lossname] += losses[lossname].item()*count
                 meanLoss = self.lossCounter[word][epoch]['loss'][lossname]/self.lossCounter[word][epoch]['counter']
@@ -210,57 +214,36 @@ class Trainer:
             plt.close()
         
     def _plot_sample(self, epoch):
-        n = 80
-        x, gt, y, mask = self.fixed_data
-        x = torch.unsqueeze(torch.tensor(x),0).to(self.gpu_id)
-        gt = torch.unsqueeze(torch.tensor(gt),0).to(self.gpu_id)
-        y = torch.unsqueeze(torch.tensor(y),0).to(self.gpu_id)
-        mask = torch.unsqueeze(torch.tensor(mask),0).to(self.gpu_id)
+        N = [40, 60, 80, 100, 120, 140, 160, 180, 200]
+        X, Y, mask = self.fixed_data
+        M = torch.unsqueeze(torch.tensor(mask),0)
+        M[M!=0] = 1.0
+        M[M==0] = self.bkg_lambda
+        M = M.to(self.gpu_id).float()
+        X = torch.unsqueeze(torch.tensor(X),0).to(self.gpu_id).float()*M
+        Y = torch.unsqueeze(torch.tensor(Y),0).to(self.gpu_id).float()*M
+        self.model.eval()
         with torch.no_grad():
-            self.model.eval()
-            (denoised, y_pred_denoised, y_pred_gt, mask_d_logit, mask_gt_logit), _, _ = self.model(x,gt,y,mask)
+            pred = self.model(X)
         
         # plot denoiser's progress
-        x = x.cpu()
-        gt = gt.cpu()
-        denoised = denoised.cpu()
+        X = X.cpu()
+        Y = Y.cpu()
+        pred = pred.cpu()
         plt.gray()
-        fig, ax = plt.subplots(3, 6, figsize=(20,6)) 
-        for i in range(6):
-            ax[0,i].imshow(torch.abs(x[0,i,n]))
+        fig, ax = plt.subplots(3, len(N), figsize=(int(10*len(N)/3),6)) 
+        for i in range(len(N)):
+            n = N[i]
+            ax[0,i].imshow(X[0,0,n])
             ax[0,i].axis('off')
-        for i in range(6):
-            ax[1,i].imshow(torch.abs(denoised[0,i,n]))
+            ax[1,i].imshow(Y[0,0,n])
             ax[1,i].axis('off')
-        for i in range(6):
-            ax[2,i].imshow(torch.abs(gt[0,i,n]))
+            ax[2,i].imshow(pred[0,0,n])
             ax[2,i].axis('off')
-        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_denoiser_pred_{epoch:03d}.png')
-        plt.close()
-        
-        # plot T1's progress
-        plt.gray()
-        y_pred_denoised = y_pred_denoised.cpu()
-        y_pred_gt = y_pred_gt.cpu()
-        y = y.cpu()
-        fig, ax = plt.subplots(2, 4, figsize=(12,6))
-        ax[0,0].imshow(torch.abs(x[0,0,n]))
-        ax[0,0].axis('off')
-        ax[0,1].imshow(torch.abs(y_pred_denoised[0,0,n]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
-        ax[0,1].axis('off')
-        ax[0,2].imshow(torch.abs(y[0,0,n]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
-        ax[0,2].axis('off')
-        ax[0,3].imshow(torch.sigmoid(mask_d_logit.cpu()[0,0,n]), vmin=0, vmax=1)
-        ax[0,3].axis('off')
-        ax[1,0].imshow(torch.abs(gt[0,0,n]))
-        ax[1,0].axis('off')
-        ax[1,1].imshow(torch.abs(y_pred_gt[0,0,n]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
-        ax[1,1].axis('off')
-        ax[1,2].imshow(torch.abs(y[0,0,n]), vmin=np.min(y.numpy()), vmax=np.max(y.numpy()))
-        ax[1,2].axis('off')
-        ax[1,3].imshow(torch.sigmoid(mask_gt_logit.cpu()[0,0,n]), vmin=0, vmax=1)
-        ax[1,3].axis('off')
-        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_T1_pred_{epoch:03d}.png')
+        ax[0,0].set_ylabel("Noisy")
+        ax[1,0].set_ylabel("Ground Truth")
+        ax[2,0].set_ylabel("Denoised")
+        plt.savefig(f'{self.parent_dir}/outputs/{self.name}/preds/{self.name}_pred_{epoch:03d}.png')
         plt.close()
         
     def train(self, epochs=100, lr_patience=10):
@@ -272,7 +255,7 @@ class Trainer:
             self._plot_loss(epoch)
             self._plot_sample(epoch)
             
-            last_loss = self.lossCounter['Testing'][epoch]['loss']["total"]/self.lossCounter['Testing'][epoch]['counter']
+            last_loss = self.lossCounter['Testing'][epoch]['loss']["MSELoss"]/self.lossCounter['Testing'][epoch]['counter']
             
             if best_loss > last_loss:
                 torch.save(self.model.module.state_dict(), f'{self.parent_dir}/outputs/{self.name}/weights/{self.name}_BEST.pth')
@@ -294,35 +277,51 @@ def prepare_dataloader(dataset, batch_size, shuffle, world_size, rank):
 def run(rank, world_size, name, epochs=100, batch_size=1, num_samples=65, folds=5, nchans=10): 
     ddp_setup(rank, world_size)
     try:
-        traintestData = []
-        T1path = sorted(glob('/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii'))
-        samples = [p.split('/')[6] for p in T1path]
-        class FullDataset(Dataset):
-            def __init__(self, index):
-                self.name = samples[index]
+        class T1Dataset(Dataset):
+    
+            def __init__(self, indices):
+                self.noisy_path = sorted(glob("/study/mrphys/skunkworks/training_data/mover01/*/processed_data/acc_2min/T1_3_tv.nii"))
+                self.groundtruth_path = sorted(glob("/study/mrphys/skunkworks/training_data/mover01/*/processed_data/T1_3_tv.nii"))
+                self.mask_path = sorted(glob('/scratch/mrphys/masks/*'))
+                self.indices = indices
+
             def __getitem__(self, index):
-                x,gt,y,mask = np.load(f'/scratch/mrphys/fullDataset3D/{self.name}/{index}.npy', allow_pickle=True)
-                return x, gt, y, mask
+                index = self.indices[index]
+                X = (np.transpose(nib.load(self.noisy_path[index]).get_fdata())/1000).reshape(1,256,256,256)
+                Y = (np.transpose(nib.load(self.groundtruth_path[index]).get_fdata())/1000).reshape(1,256,256,256)
+                mask = np.load(self.mask_path[index]).reshape(1,256,256,256)
+                return X, Y, mask
+
             def __len__(self):
-                return 27
-            
-        for i in tqdm(range(len(samples[0:num_samples]))):
-            traintestData.append(FullDataset(i))
+                return len(self.indices)
                     
         kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
-        for i, (train_index, test_index) in enumerate(kfsplitter.split(traintestData)):
+        for i, (train_index, test_index) in enumerate(kfsplitter.split(list(range(num_samples)))):
             if rank==0:
                 print(f'Train Index = {train_index}\nTest Index = {test_index}')
             fold = i+1
-            trainData = [traintestData[i] for i in train_index]
-            testData = [traintestData[i] for i in test_index]
-            trainDataset = torch.utils.data.ConcatDataset(trainData)
-            testDataset = torch.utils.data.ConcatDataset(testData)
+            trainDataset = T1Dataset(train_index)
+            testDataset = T1Dataset(test_index)
             trainDataloader = prepare_dataloader(trainDataset, batch_size, True, world_size, rank)
             testDataloader = prepare_dataloader(testDataset, batch_size, False, world_size, rank)
-            fixed_data = testDataset[150]
+            fixed_data = testDataset[0]
+            
+            model = UNet(
+                1,
+                1,
+                f_maps=16,
+                layer_order=['separable convolution', 'relu'],
+                depth=4,
+                layer_growth=2.0,
+                residual=True,
+                complex_input=False,
+                complex_kernel=False,
+                ndims=3,
+                padding=1
+            )
+            
             trainer = Trainer(
-                fullModel(f=16, nchans=nchans),
+                model,
                 [trainDataloader, testDataloader],
                 f'{name}_{fold}',
                 fixed_data,
@@ -337,7 +336,7 @@ def run(rank, world_size, name, epochs=100, batch_size=1, num_samples=65, folds=
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Param Parser')
-    parser.add_argument('--name', help='model name', default='3dModel')
+    parser.add_argument('--name', help='model name', default='T1denoiser_3d')
     parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=1, type=int)
     parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
