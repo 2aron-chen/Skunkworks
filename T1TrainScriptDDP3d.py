@@ -297,6 +297,8 @@ def run(rank, world_size, name, epochs=100, batch_size=1, num_samples=65, folds=
                     
         kfsplitter = kf(n_splits=folds, shuffle=True, random_state=69420)
         for i, (train_index, test_index) in enumerate(kfsplitter.split(list(range(num_samples)))):
+            if i in [3]:
+                continue
             if rank==0:
                 print(f'Train Index = {train_index}\nTest Index = {test_index}')
             fold = i+1
@@ -326,6 +328,7 @@ def run(rank, world_size, name, epochs=100, batch_size=1, num_samples=65, folds=
                 f'{name}_{fold}',
                 fixed_data,
                 gpu_id = rank,
+                lr=1e-2,
             )
             trainer.train(epochs = epochs)
     except Exception as e:
@@ -337,7 +340,7 @@ if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Param Parser')
     parser.add_argument('--name', help='model name', default='T1denoiser_3d')
-    parser.add_argument('--epochs', help='no. of epochs', default=100, type=int)
+    parser.add_argument('--epochs', help='no. of epochs', default=200, type=int)
     parser.add_argument('--batchsize', help='batch size of training and testing data', default=1, type=int)
     parser.add_argument('--num_gpu', help='number of gpus', default=torch.cuda.device_count(), type=int)
     parser.add_argument('--samples', help='number of samples', default=65, type=int)
